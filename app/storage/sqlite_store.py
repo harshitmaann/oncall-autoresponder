@@ -127,7 +127,20 @@ class IncidentStore:
             try:
                 msg = k8s_actions.rollout_restart_deployment(namespace=ns, deployment=deployment)
                 self._audit(incident_id, "rollout_restart", "executed", msg)
-                return f"{msg}\nIncident `{incident_id}`: {incident['title']}"
+
+                verify = k8s_actions.verify_deployment(namespace=ns, deployment=deployment, wait_seconds=30)
+
+                verdict = "✅ Verification PASS" if verify["ok"] else "❌ Verification FAIL"
+                details = (
+                    f"- rollout: desired={verify['desired']} updated={verify['updated']} "
+                    f"ready={verify['ready']} available={verify['available']}\n"
+                    f"- pods: {verify['pod_count']} max_restarts={verify['max_restarts']}\n"
+                    f"- restartedAt: {verify['restarted_at']}"
+                )
+
+                self._audit(incident_id, "verify", "pass" if verify["ok"] else "fail", details)
+
+                return f"{msg}\n{verdict}\n{details}\nIncident `{incident_id}`: {incident['title']}"
             except Exception as e:
                 self._audit(incident_id, "rollout_restart", "failed", str(e))
                 return f"⚠️ Restart failed for incident `{incident_id}`: {e}"
