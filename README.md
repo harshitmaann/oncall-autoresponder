@@ -172,7 +172,7 @@ Expected flow:
 
 ---
 
-## Roadmap (next YC-level upgrades)
+## Roadmap (upcoming upgrades)
 
 - Deployment auto-discovery by labels (stop assuming deployment == service)
 - Least-privilege RBAC + in-cluster deployment manifests
@@ -185,4 +185,4 @@ Expected flow:
 
 ## License
 
-MIT (update as needed)
+MIT
