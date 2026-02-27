@@ -1,7 +1,7 @@
 import json
 import sqlite3
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 import json as _json
 from app.core.schemas import Incident
 
@@ -40,14 +40,20 @@ class IncidentStore:
         )
         """)
         self.conn.commit()
+        self._migrate_incidents_columns()
 
-    def _already_executed(self, incident_id: str, action_type: str) -> bool:
+    def _migrate_incidents_columns(self) -> None:
+        # Add slack_channel_id + slack_message_ts if missing
         cur = self.conn.cursor()
-        cur.execute(
-            "SELECT 1 FROM action_audit WHERE incident_id=? AND action_type=? AND status='executed' LIMIT 1",
-            (incident_id, action_type),
-        )
-        return cur.fetchone() is not None
+        cur.execute("PRAGMA table_info(incidents)")
+        cols = {row[1] for row in cur.fetchall()}
+
+        if "slack_channel_id" not in cols:
+            cur.execute("ALTER TABLE incidents ADD COLUMN slack_channel_id TEXT")
+        if "slack_message_ts" not in cols:
+            cur.execute("ALTER TABLE incidents ADD COLUMN slack_message_ts TEXT")
+
+        self.conn.commit()
 
     def upsert_incident(self, incident: Incident) -> None:
         cur = self.conn.cursor()
@@ -81,6 +87,25 @@ class IncidentStore:
         ))
         self.conn.commit()
 
+    def set_slack_meta(self, incident_id: str, slack_channel_id: str, slack_message_ts: str) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            "UPDATE incidents SET slack_channel_id=?, slack_message_ts=? WHERE incident_id=?",
+            (slack_channel_id, slack_message_ts, incident_id),
+        )
+        self.conn.commit()
+
+    def get_slack_meta(self, incident_id: str) -> Optional[Dict[str, str]]:
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT slack_channel_id, slack_message_ts FROM incidents WHERE incident_id=?",
+            (incident_id,),
+        )
+        row = cur.fetchone()
+        if not row or not row[0] or not row[1]:
+            return None
+        return {"channel": row[0], "ts": row[1]}
+
     def _get_incident(self, incident_id: str) -> Dict[str, Any]:
         cur = self.conn.cursor()
         cur.execute(
@@ -108,38 +133,67 @@ class IncidentStore:
         )
         self.conn.commit()
 
-    def handle_slack_action(self, payload_str: str, k8s_actions) -> str:
+    def _already_executed(self, incident_id: str, action_type: str) -> bool:
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT 1 FROM action_audit WHERE incident_id=? AND action_type=? AND status='executed' LIMIT 1",
+            (incident_id, action_type),
+        )
+        return cur.fetchone() is not None
+
+    def handle_slack_action(self, payload_str: str, k8s_actions) -> Dict[str, Any]:
+        """
+        Returns a dict so the caller can:
+        - post a follow-up message (text)
+        - update the original message (remove buttons)
+        """
         payload = _json.loads(payload_str)
         actions = payload.get("actions", [])
         if not actions:
-            return "No action in Slack payload."
+            return {"text": "No action in Slack payload."}
 
         action = actions[0]
         action_id = action.get("action_id")
         incident_id = action.get("value")
 
         if not incident_id:
-            return "Missing incident_id."
+            return {"text": "Missing incident_id."}
+
+        approver_id = (payload.get("user") or {}).get("id") or ""
+        approver_name = (payload.get("user") or {}).get("username") or ""
+        approver = approver_name or approver_id or "unknown"
 
         incident = self._get_incident(incident_id)
         ns = incident["namespace"]
         svc = incident["service"]
 
         if action_id == "reject_action":
-            self._audit(incident_id, "reject", "rejected", "User rejected action")
-            return f"❌ Action rejected for incident `{incident_id}`."
+            self._audit(incident_id, "reject", "rejected", f"rejected_by={approver}")
+            return {
+                "text": f"❌ Action rejected for incident `{incident_id}`.",
+                "update": {"incident_id": incident_id, "status": f"Rejected by {approver}"},
+            }
 
         if action_id == "approve_rollout_restart":
             deployment = svc  # MVP mapping: deployment == service
+
             if self._already_executed(incident_id, "rollout_restart"):
-                return f"✅ Rollout restart already executed for incident `{incident_id}`."
-            self._audit(incident_id, "rollout_restart", "approved", f"Approved restart for {deployment} in {ns}")
+                return {
+                    "text": f"✅ Rollout restart already executed for incident `{incident_id}`.",
+                    "update": {"incident_id": incident_id, "status": "Already executed"},
+                }
+
+            self._audit(
+                incident_id,
+                "rollout_restart",
+                "approved",
+                f"approved_by={approver} deployment={deployment} namespace={ns}",
+            )
             try:
                 msg = k8s_actions.rollout_restart_deployment(namespace=ns, deployment=deployment)
                 self._audit(incident_id, "rollout_restart", "executed", msg)
 
                 verify = k8s_actions.verify_deployment(namespace=ns, deployment=deployment, wait_seconds=30)
-
                 verdict = "✅ Verification PASS" if verify["ok"] else "❌ Verification FAIL"
                 details = (
                     f"- rollout: desired={verify['desired']} updated={verify['updated']} "
@@ -147,12 +201,14 @@ class IncidentStore:
                     f"- pods: {verify['pod_count']} max_restarts={verify['max_restarts']}\n"
                     f"- restartedAt: {verify['restarted_at']}"
                 )
-
                 self._audit(incident_id, "verify", "pass" if verify["ok"] else "fail", details)
 
-                return f"{msg}\n{verdict}\n{details}\nIncident `{incident_id}`: {incident['title']}"
+                return {
+                    "text": f"{msg}\n{verdict}\n{details}\nIncident `{incident_id}`: {incident['title']}",
+                    "update": {"incident_id": incident_id, "status": f"Approved by {approver}"},
+                }
             except Exception as e:
                 self._audit(incident_id, "rollout_restart", "failed", str(e))
-                return f"⚠️ Restart failed for incident `{incident_id}`: {e}"
+                return {"text": f"⚠️ Restart failed for incident `{incident_id}`: {e}"}
 
-        return f"Unknown Slack action: {action_id}"
+        return {"text": f"Unknown Slack action: {action_id}"}

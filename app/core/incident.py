@@ -45,7 +45,12 @@ class IncidentService:
         incident.evidence["classification"] = classification
         incident.evidence["k8s"] = self.k8s.collect_basic(namespace=namespace, service=service)
 
+        # persist incident first
         self.store.upsert_incident(incident)
-        self.slack.post_incident_brief(incident)
+
+        # post to Slack and store message metadata for later updates
+        meta = self.slack.post_incident_brief(incident)
+        if meta and meta.get("channel") and meta.get("ts"):
+            self.store.set_slack_meta(incident_id, meta["channel"], meta["ts"])
 
         return incident
