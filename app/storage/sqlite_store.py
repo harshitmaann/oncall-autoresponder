@@ -41,6 +41,14 @@ class IncidentStore:
         """)
         self.conn.commit()
 
+    def _already_executed(self, incident_id: str, action_type: str) -> bool:
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT 1 FROM action_audit WHERE incident_id=? AND action_type=? AND status='executed' LIMIT 1",
+            (incident_id, action_type),
+        )
+        return cur.fetchone() is not None
+
     def upsert_incident(self, incident: Incident) -> None:
         cur = self.conn.cursor()
         cur.execute("""
@@ -123,6 +131,8 @@ class IncidentStore:
 
         if action_id == "approve_rollout_restart":
             deployment = svc  # MVP mapping: deployment == service
+            if self._already_executed(incident_id, "rollout_restart"):
+                return f"✅ Rollout restart already executed for incident `{incident_id}`."
             self._audit(incident_id, "rollout_restart", "approved", f"Approved restart for {deployment} in {ns}")
             try:
                 msg = k8s_actions.rollout_restart_deployment(namespace=ns, deployment=deployment)
